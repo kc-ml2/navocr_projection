@@ -215,7 +215,7 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
       
       detection.image = img_copy;
-      saveDetectionImage(img_copy, bbox, detection_count_);
+      saveDetectionImage(img_copy, bbox, frame_count_, detection_count_);
     }
     
     // Transform to world frame
@@ -315,10 +315,10 @@ void NavOCRSLAMNode::publishMarkers()
   RCLCPP_DEBUG(this->get_logger(), "Published %zu markers", marker_array.markers.size());
 }
 
-void NavOCRSLAMNode::saveDetectionImage(const cv::Mat & image, const cv::Rect & bbox, int detection_id)
+void NavOCRSLAMNode::saveDetectionImage(const cv::Mat & image, const cv::Rect & bbox, int frame_id, int detection_id)
 {
   std::stringstream ss;
-  ss << images_dir_ << "/detection_" << std::setw(6) << std::setfill('0') << detection_id << ".jpg";
+  ss << images_dir_ << "/detection_frame_" << std::setw(6) << std::setfill('0') << frame_id ".jpg";
   cv::imwrite(ss.str(), image);
   RCLCPP_DEBUG(this->get_logger(), "Saved detection image: %s", ss.str().c_str());
 }
