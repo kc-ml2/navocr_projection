@@ -31,6 +31,7 @@ struct Detection
   int frame_id;
   cv::Rect bbox;
   double confidence;
+  std::string text;  // OCR recognized text
   rclcpp::Time timestamp;
   double depth_m;
   cv::Point3d camera_pos;  // 3D position in camera frame
@@ -58,7 +59,7 @@ private:
   bool transformToWorld(const cv::Point3d & camera_point, const rclcpp::Time & timestamp, 
                         cv::Point3d & world_point);
   void publishMarkers();
-  void saveDetectionImage(const cv::Mat & image, const cv::Rect & bbox, int detection_id);
+  void saveDetectionImage(const cv::Mat & image, const cv::Rect & bbox, int frame_id, int detection_id);
   
   // Utility functions
   void saveDetections();

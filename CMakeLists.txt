@@ -54,15 +54,4 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}/
 )
 
-# Install config files
-install(DIRECTORY config
-  DESTINATION share/${PROJECT_NAME}/
-)
-
-# Install scripts
-install(DIRECTORY scripts/
-  DESTINATION lib/${PROJECT_NAME}
-  USE_SOURCE_PERMISSIONS
-)
-
 ament_package()

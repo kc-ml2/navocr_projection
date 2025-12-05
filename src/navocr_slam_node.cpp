@@ -165,6 +165,14 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     double confidence = det.results[0].hypothesis.score;
     if (confidence < confidence_threshold_) continue;
     
+    // Extract OCR label from class_id (PaddleOCR result)
+    std::string label = det.results[0].hypothesis.class_id;
+    RCLCPP_INFO(this->get_logger(), "🔍 Received detection with class_id='%s'", label.c_str());
+    if (label.empty()) {
+      label = "Unknown";
+      RCLCPP_WARN(this->get_logger(), "⚠️  Empty class_id received, using 'Unknown'");
+    }
+    
     // Get bounding box center
     int center_u = static_cast<int>(det.bbox.center.position.x);
     int center_v = static_cast<int>(det.bbox.center.position.y);
@@ -199,6 +207,7 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     detection.frame_id = frame_count_;
     detection.bbox = bbox;
     detection.confidence = confidence;
+    detection.text = label;  // Store OCR text from vision_msgs
     detection.timestamp = msg->header.stamp;
     detection.depth_m = depth_m;
     detection.camera_pos = camera_point;
@@ -241,11 +250,6 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
   publishMarkers();
 }
 
-void NavOCRSLAMNode::processDetections(const vision_msgs::msg::Detection2DArray::SharedPtr detections)
-{
-  // This function is no longer needed as we process in detectionCallback
-}
-
 void NavOCRSLAMNode::publishMarkers()
 {
   visualization_msgs::msg::MarkerArray marker_array;
@@ -273,10 +277,10 @@ void NavOCRSLAMNode::publishMarkers()
     
     marker.pose.orientation.w = 1.0;
     
-    // Size (0.1m cube)
-    marker.scale.x = 0.1;
-    marker.scale.y = 0.1;
-    marker.scale.z = 0.1;
+    // Size (0.3m cube - larger for better visibility)
+    marker.scale.x = 0.3;
+    marker.scale.y = 0.3;
+    marker.scale.z = 0.3;
     
     // Color based on confidence (green to red)
     marker.color.r = 1.0 - det.confidence;
@@ -296,16 +300,15 @@ void NavOCRSLAMNode::publishMarkers()
     text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     text_marker.action = visualization_msgs::msg::Marker::ADD;
     text_marker.pose = marker.pose;
-    text_marker.pose.position.z += 0.15;  // Above the cube
+    text_marker.pose.position.z += 0.3;  // Above the cube
     
-    std::stringstream ss;
-    ss << std::fixed << std::setprecision(2) << det.confidence;
-    text_marker.text = ss.str();
+    // Display OCR text instead of confidence
+    text_marker.text = det.text.empty() ? "no_text" : det.text;
     
-    text_marker.scale.z = 0.05;  // Text height
+    text_marker.scale.z = 0.2;  // Text height (much larger for better visibility)
     text_marker.color.r = 1.0;
     text_marker.color.g = 1.0;
-    text_marker.color.b = 1.0;
+    text_marker.color.b = 0.0;  // Yellow text
     text_marker.color.a = 1.0;
     
     marker_array.markers.push_back(text_marker);
@@ -318,7 +321,7 @@ void NavOCRSLAMNode::publishMarkers()
 void NavOCRSLAMNode::saveDetectionImage(const cv::Mat & image, const cv::Rect & bbox, int frame_id, int detection_id)
 {
   std::stringstream ss;
-  ss << images_dir_ << "/detected_frame_" << std::setw(6) << std::setfill('0') << frame_id ".jpg";
+  ss << images_dir_ << "/detection_frame_" << std::setw(6) << std::setfill('0') << frame_id << ".jpg";
   cv::imwrite(ss.str(), image);
   RCLCPP_DEBUG(this->get_logger(), "Saved detection image: %s", ss.str().c_str());
 }
@@ -385,20 +388,30 @@ void NavOCRSLAMNode::saveDetections()
   }
   
   // Write header
-  csv_file << "frame,bbox_x,bbox_y,bbox_w,bbox_h,confidence,"
+  csv_file << "frame,bbox_x,bbox_y,bbox_w,bbox_h,confidence,label,"
            << "timestamp_sec,timestamp_nsec,depth_m,"
            << "camera_x,camera_y,camera_z,"
            << "world_x,world_y,world_z,has_world_pos\n";
+  
+  // Set precision for timestamps to avoid scientific notation
+  csv_file << std::fixed << std::setprecision(0);
   
   // Write data
   for (const auto & det : detections_) {
     csv_file << det.frame_id << ","
              << det.bbox.x << "," << det.bbox.y << "," 
-             << det.bbox.width << "," << det.bbox.height << ","
-             << det.confidence << ","
-             << det.timestamp.seconds() << ","
-             << det.timestamp.nanoseconds() << ","
-             << det.depth_m << ","
+             << det.bbox.width << "," << det.bbox.height << ",";
+    
+    // Reset precision for confidence (float)
+    csv_file << std::setprecision(6) << det.confidence << ","
+             << det.text << ",";  // Add OCR text
+    
+    // Fixed precision for timestamps (no scientific notation)
+    csv_file << std::setprecision(0) << det.timestamp.seconds() << ","
+             << det.timestamp.nanoseconds() << ",";
+    
+    // Reset precision for depth and positions
+    csv_file << std::setprecision(6) << det.depth_m << ","
              << det.camera_pos.x << "," << det.camera_pos.y << "," << det.camera_pos.z << ",";
     
     if (det.has_world_pos) {
