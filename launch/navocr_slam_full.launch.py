@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
 NavOCR-SLAM 통합 Launch 파일
-rtabmap + NavOCR detection + 3D projection을 모두 실행
+rtabmap SLAM + NavOCR detection + Landmark clustering을 실행
 """
 
 from launch import LaunchDescription
 from launch_ros.actions import Node, SetParameter
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
+import os
 
 
 def generate_launch_description():
+    
+    # Get directories
+    home_dir = os.path.expanduser('~')
+    output_dir = os.path.join(home_dir, 'workspace', 'src', 'navocr_projection', 'results_cpp')
+    navocr_script = os.path.join(home_dir, 'workspace', 'src', 'NavOCR', 'run_navocr_ros_with_ocr.py')
     
     # rtabmap 파라미터
     rtabmap_parameters = [{
@@ -19,7 +25,7 @@ def generate_launch_description():
         'subscribe_odom_info': True,
         'approx_sync': False,
         'wait_imu_to_init': True,
-        'use_sim_time': True,  # rosbag 시간 사용
+        'use_sim_time': True,
     }]
     
     rtabmap_remappings = [
@@ -30,7 +36,7 @@ def generate_launch_description():
     ]
     
     return LaunchDescription([
-        # Global parameter: use simulation time
+        # Global parameter: use simulation time for rosbag playback
         SetParameter(name='use_sim_time', value=True),
         
         # 1. IMU 필터 (quaternion 계산)
@@ -56,7 +62,7 @@ def generate_launch_description():
             remappings=rtabmap_remappings
         ),
         
-        # 3. RTABMAP SLAM
+        # 3. RTABMAP SLAM (map frame 생성)
         Node(
             package='rtabmap_slam',
             executable='rtabmap',
@@ -66,18 +72,26 @@ def generate_launch_description():
             arguments=['-d']  # Delete database on start
         ),
         
-        # 4. NavOCR-SLAM C++ 노드 (3D projection)
+        # 4. NavOCR Python 스크립트 (OCR detection)
+        ExecuteProcess(
+            cmd=['python3', navocr_script],
+            output='screen',
+            shell=False
+        ),
+        
+        # 5. NavOCR-SLAM C++ 노드 (Landmark clustering)
         Node(
             package='navocr_projection',
             executable='navocr_slam_cpp',
             name='navocr_slam_cpp',
             output='screen',
             parameters=[{
-                'output_dir': '/home/sehyeon/ros2_ws/src/navocr_projection/results_cpp',
+                'output_dir': output_dir,
                 'confidence_threshold': 0.3,
-                'save_images': True,
                 'camera_frame': 'camera_infra1_optical_frame',
-                'world_frame': 'map',  # rtabmap이 생성하는 map 프레임 사용
+                'world_frame': 'map',  # rtabmap이 생성하는 map frame 사용
+                'sensor_noise_std': 0.3,
+                'min_observations': 3,
                 'use_sim_time': True,
             }]
         ),
