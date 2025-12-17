@@ -12,9 +12,9 @@ NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
   camera_info_received_(false),
   frame_count_(0),
   detection_count_(0),
-  next_landmark_id_(0),
+  next_landmark_id_(1),
   chi2_threshold_(11.3),              // χ²(3, 0.99) - statistical constant
-  text_similarity_threshold_(0.6),    // 60% similarity - empirical value
+  text_similarity_threshold_(0.3),    // 30% similarity - relaxed for OCR variability
   acceptance_threshold_(0.5),         // 50% confidence - balanced threshold
   text_history_size_(50)              // Sliding window size
 {
@@ -27,6 +27,7 @@ NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
   // Tunable landmark parameters
   this->declare_parameter("sensor_noise_std", 0.3);      // 30cm depth noise (sensor-specific)
   this->declare_parameter("min_observations", 3);        // Minimum observations for valid landmark
+  this->declare_parameter("merge_search_radius", 10.0);  // Search radius for spatial filtering (meters)
   
   // Get parameters
   output_dir_ = this->get_parameter("output_dir").as_string();
@@ -36,8 +37,9 @@ NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
   
   sensor_noise_std_ = this->get_parameter("sensor_noise_std").as_double();
   min_observations_ = this->get_parameter("min_observations").as_int();
+  merge_search_radius_ = this->get_parameter("merge_search_radius").as_double();
   
-  last_merge_time_ = this->now();
+  // Removed: last_merge_time_ initialization (immediate merging enabled)
   confidence_threshold_ = this->get_parameter("confidence_threshold").as_double();
   camera_frame_ = this->get_parameter("camera_frame").as_string();
   world_frame_ = this->get_parameter("world_frame").as_string();
@@ -79,6 +81,7 @@ NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(this->get_logger(), "=== Landmark Manager Settings ===");
   RCLCPP_INFO(this->get_logger(), "  Sensor noise: %.2fm", sensor_noise_std_);
   RCLCPP_INFO(this->get_logger(), "  Min observations: %d", min_observations_);
+  RCLCPP_INFO(this->get_logger(), "  Merge search radius: %.1fm", merge_search_radius_);
   RCLCPP_INFO(this->get_logger(), "  Chi² threshold: %.1f (fixed)", chi2_threshold_);
   RCLCPP_INFO(this->get_logger(), "  Text similarity threshold: %.2f (fixed)", text_similarity_threshold_);
   RCLCPP_INFO(this->get_logger(), "  Acceptance threshold: %.2f (fixed)", acceptance_threshold_);
@@ -210,8 +213,8 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
       detection.world_pos = point_in_world_frame;
       detection.has_world_pos = true;
       
-      // Add to landmark manager (online clustering)
-      addObservationToLandmarks(point_in_world_frame, label, msg->header.stamp);
+      // Add to landmark manager (online clustering) with OCR confidence
+      addObservationToLandmarks(point_in_world_frame, label, msg->header.stamp, confidence);
       
       RCLCPP_INFO(this->get_logger(),
                   "Detection #%d at world pos (%.2f, %.2f, %.2f), depth=%.2fm, conf=%.2f, text='%s'",
@@ -228,11 +231,8 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     detection_count_++;
   }
   
-  // Periodic landmark merging (every 5 seconds)
-  if ((this->now() - last_merge_time_).seconds() > 5.0) {
-    mergeLandmarks();
-    last_merge_time_ = this->now();
-  }
+  // Removed: Periodic merging (5-second timer)
+  // Merging now happens immediately in checkAndMergeNewLandmark()
   
   // Publish markers for RViz (now shows consolidated landmarks)
   publishMarkers();
@@ -367,7 +367,8 @@ bool NavOCRSLAMNode::transformToWorld(const Eigen::Vector3d & point_in_camera_fr
 
 void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos, 
                                                 const std::string & text,
-                                                const rclcpp::Time & timestamp)
+                                                const rclcpp::Time & timestamp,
+                                                double ocr_confidence)
 {
   // Step 1: Find candidate landmarks (geometric proximity)
   std::vector<std::pair<int, double>> candidates;  // (index, score)
@@ -381,9 +382,9 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
       // Calculate text similarity
       double text_sim = textSimilarity(text, landmarks_[i].representative_text);
       
-      // Combined score: 80% geometry, 20% text
+      // Combined score: 90% geometry, 10% text (relaxed for OCR noise)
       double geo_score = 1.0 - (d_squared / chi2_threshold_);
-      double final_score = 0.8 * geo_score + 0.2 * text_sim;
+      double final_score = 0.9 * geo_score + 0.1 * text_sim;
       
       candidates.push_back({i, final_score});
     }
@@ -401,19 +402,19 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
     // Step 3: Accept or reject
     if (best_score > acceptance_threshold_) {
       // Update existing landmark
-      updateLandmark(landmarks_[best_idx], world_pos, text, timestamp);
+      updateLandmark(landmarks_[best_idx], world_pos, text, timestamp, ocr_confidence);
       RCLCPP_DEBUG(this->get_logger(), 
-                   "Observation '%s' merged to Landmark #%d (score=%.2f)", 
-                   text.c_str(), landmarks_[best_idx].landmark_id, best_score);
+                   "Observation '%s' (conf=%.2f) merged to Landmark #%d (score=%.2f)", 
+                   text.c_str(), ocr_confidence, landmarks_[best_idx].landmark_id, best_score);
       return;
     }
   }
   
   // Step 4: Create new landmark if no match
-  createLandmark(world_pos, text, timestamp);
+  createLandmark(world_pos, text, timestamp, ocr_confidence);
   RCLCPP_INFO(this->get_logger(), 
-              "New landmark #%d created for '%s' at (%.2f, %.2f, %.2f)", 
-              next_landmark_id_ - 1, text.c_str(), world_pos.x(), world_pos.y(), world_pos.z());
+              "New landmark #%d created for '%s' (conf=%.2f) at (%.2f, %.2f, %.2f)", 
+              next_landmark_id_ - 1, text.c_str(), ocr_confidence, world_pos.x(), world_pos.y(), world_pos.z());
 }
 
 double NavOCRSLAMNode::mahalanobisDistance(const Eigen::Vector3d & point, const Landmark & landmark)
@@ -469,7 +470,8 @@ double NavOCRSLAMNode::textSimilarity(const std::string & s1, const std::string 
 void NavOCRSLAMNode::updateLandmark(Landmark & landmark, 
                                      const Eigen::Vector3d & new_pos,
                                      const std::string & new_text,
-                                     const rclcpp::Time & timestamp)
+                                     const rclcpp::Time & timestamp,
+                                     double ocr_confidence)
 {
   // Welford's online algorithm for mean update
   landmark.observation_count++;
@@ -483,13 +485,13 @@ void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
   // Simple covariance update (could use Welford's for variance too)
   // For now, keep initial covariance or use simple moving average
   
-  // Add text to history (sliding window)
-  landmark.text_history.push_back(new_text);
+  // Add text to history (sliding window) with OCR confidence
+  landmark.text_history.push_back({new_text, ocr_confidence});
   if (landmark.text_history.size() > static_cast<size_t>(text_history_size_)) {
     landmark.text_history.pop_front();
   }
   
-  // Update representative text (majority vote)
+  // Update representative text (weighted by confidence)
   updateRepresentativeText(landmark);
   
   landmark.last_updated = timestamp;
@@ -497,7 +499,8 @@ void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
 
 void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos, 
                                      const std::string & text,
-                                     const rclcpp::Time & timestamp)
+                                     const rclcpp::Time & timestamp,
+                                     double ocr_confidence)
 {
   Landmark lm;
   lm.mean_position = pos;
@@ -512,11 +515,14 @@ void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos,
   lm.covariance(1, 1) = var;
   lm.covariance(2, 2) = var * 9.0;  // z-axis (depth) has 3x more noise
   
-  lm.text_history.push_back(text);
+  lm.text_history.push_back({text, ocr_confidence});
   lm.representative_text = text;
-  lm.text_confidence = 1.0;
+  lm.text_confidence = ocr_confidence;  // Initial confidence from OCR
   
   landmarks_.push_back(lm);
+  
+  // Immediately check if this new landmark should merge with existing ones
+  checkAndMergeNewLandmark(landmarks_.size() - 1);
 }
 
 void NavOCRSLAMNode::updateRepresentativeText(Landmark & landmark)
@@ -526,22 +532,146 @@ void NavOCRSLAMNode::updateRepresentativeText(Landmark & landmark)
     return;
   }
   
-  // Count frequency of each text
-  std::map<std::string, int> text_counts;
-  for (const auto & text : landmark.text_history) {
-    text_counts[text]++;
+  // Weighted voting: Sum confidence scores for each unique text
+  std::map<std::string, double> weighted_scores;  // text -> sum of confidences
+  
+  for (const auto & [text, conf] : landmark.text_history) {
+    weighted_scores[text] += conf;  // Accumulate confidence
   }
   
-  // Find most common text
-  auto max_elem = std::max_element(text_counts.begin(), text_counts.end(),
-                                     [](const auto& a, const auto& b) { return a.second < b.second; });
+  // Find text with highest weighted score
+  auto max_elem = std::max_element(weighted_scores.begin(), weighted_scores.end(),
+                                     [](const auto& a, const auto& b) { 
+                                       return a.second < b.second; 
+                                     });
   
   landmark.representative_text = max_elem->first;
-  landmark.text_confidence = static_cast<double>(max_elem->second) / landmark.text_history.size();
+  
+  // Confidence = (sum of matching confidences) / (total confidence sum)
+  double total_confidence = 0.0;
+  for (const auto & [text, score] : weighted_scores) {
+    total_confidence += score;
+  }
+  
+  landmark.text_confidence = max_elem->second / total_confidence;
+  
+  RCLCPP_DEBUG(this->get_logger(), 
+               "Landmark #%d: representative='%s', confidence=%.2f (weighted from %zu observations)",
+               landmark.landmark_id, landmark.representative_text.c_str(), 
+               landmark.text_confidence, landmark.text_history.size());
+}
+
+Eigen::Vector3d NavOCRSLAMNode::getCurrentRobotPosition()
+{
+  // Try to get robot position from latest odometry
+  if (latest_odom_) {
+    return Eigen::Vector3d(
+      latest_odom_->pose.pose.position.x,
+      latest_odom_->pose.pose.position.y,
+      latest_odom_->pose.pose.position.z
+    );
+  }
+  
+  // Fallback: try to get transform from world frame to camera frame
+  try {
+    auto transform = tf_buffer_->lookupTransform(world_frame_, camera_frame_, tf2::TimePointZero);
+    return Eigen::Vector3d(
+      transform.transform.translation.x,
+      transform.transform.translation.y,
+      transform.transform.translation.z
+    );
+  } catch (tf2::TransformException & ex) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Could not get robot position: %s", ex.what());
+  }
+  
+  // Last resort: return origin
+  return Eigen::Vector3d::Zero();
+}
+
+void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
+{
+  if (new_idx >= landmarks_.size()) {
+    RCLCPP_WARN(this->get_logger(), "Invalid landmark index %zu", new_idx);
+    return;
+  }
+  
+  Landmark& new_lm = landmarks_[new_idx];
+  
+  // Get current robot position for spatial filtering
+  Eigen::Vector3d robot_pos = getCurrentRobotPosition();
+  
+  int candidates_checked = 0;
+  int candidates_skipped = 0;
+  
+  // Check all existing landmarks (except itself) for potential merge
+  for (size_t i = 0; i < landmarks_.size(); i++) {
+    if (i == new_idx) continue;  // Skip self
+    
+    // Spatial filtering: Skip landmarks too far from robot
+    double dist_to_robot = (landmarks_[i].mean_position - robot_pos).norm();
+    if (dist_to_robot > merge_search_radius_) {
+      candidates_skipped++;
+      continue;  // Skip distant landmarks
+    }
+    
+    candidates_checked++;
+    
+    // Calculate Euclidean distance
+    double dist = (new_lm.mean_position - landmarks_[i].mean_position).norm();
+    
+    // Merge criteria: distance < 1.0m (relaxed from 0.5m)
+    if (dist < 1.0) {
+      // Calculate text similarity
+      double text_sim = textSimilarity(new_lm.representative_text, 
+                                        landmarks_[i].representative_text);
+      
+      // Merge criteria: text similarity > 0.3 (30%, relaxed for OCR noise)
+      if (text_sim > 0.3) {
+        // Merge new landmark into existing landmark i
+        int total_N = landmarks_[i].observation_count + new_lm.observation_count;
+        
+        // Weighted average of positions
+        landmarks_[i].mean_position = 
+          (landmarks_[i].mean_position * landmarks_[i].observation_count +
+           new_lm.mean_position * new_lm.observation_count) / total_N;
+        
+        landmarks_[i].observation_count = total_N;
+        
+        // Merge text histories (with confidence values)
+        for (const auto & text_conf_pair : new_lm.text_history) {
+          landmarks_[i].text_history.push_back(text_conf_pair);
+        }
+        while (landmarks_[i].text_history.size() > static_cast<size_t>(text_history_size_)) {
+          landmarks_[i].text_history.pop_front();
+        }
+        
+        updateRepresentativeText(landmarks_[i]);
+        
+        RCLCPP_INFO(this->get_logger(), 
+                    "New landmark #%d immediately merged with #%d (dist=%.2fm, text_sim=%.2f, checked=%d, skipped=%d)",
+                    new_lm.landmark_id, landmarks_[i].landmark_id, dist, text_sim, 
+                    candidates_checked, candidates_skipped);
+        
+        // Remove the new landmark (it's been merged)
+        landmarks_.erase(landmarks_.begin() + new_idx);
+        
+        return;  // Merge complete, exit
+      }
+    }
+  }
+  
+  // No merge candidate found - landmark remains as is
+  RCLCPP_DEBUG(this->get_logger(), 
+               "New landmark #%d created (no merge candidate found, checked=%d, skipped=%d)",
+               new_lm.landmark_id, candidates_checked, candidates_skipped);
 }
 
 void NavOCRSLAMNode::mergeLandmarks()
 {
+  // NOTE: This function is no longer called automatically (real-time merging enabled)
+  // It can be used for manual cleanup if needed
+  
   // Merge landmarks that are too close with similar text
   for (size_t i = 0; i < landmarks_.size(); i++) {
     for (size_t j = i + 1; j < landmarks_.size(); j++) {
@@ -549,8 +679,8 @@ void NavOCRSLAMNode::mergeLandmarks()
       double text_sim = textSimilarity(landmarks_[i].representative_text, 
                                         landmarks_[j].representative_text);
       
-      // Merge criteria: close distance (< 0.5m) AND similar text (> 70%)
-      if (dist < 0.5 && text_sim > 0.7) {
+      // Merge criteria: close distance (< 1.0m) AND similar text (> 30%)
+      if (dist < 1.0 && text_sim > 0.3) {
         // Merge j into i (keep one with more observations)
         if (landmarks_[i].observation_count >= landmarks_[j].observation_count) {
           // Combine observations
@@ -563,9 +693,9 @@ void NavOCRSLAMNode::mergeLandmarks()
           
           landmarks_[i].observation_count = total_N;
           
-          // Merge text histories
-          for (const auto & text : landmarks_[j].text_history) {
-            landmarks_[i].text_history.push_back(text);
+          // Merge text histories (with confidence values)
+          for (const auto & text_conf_pair : landmarks_[j].text_history) {
+            landmarks_[i].text_history.push_back(text_conf_pair);
           }
           while (landmarks_[i].text_history.size() > static_cast<size_t>(text_history_size_)) {
             landmarks_[i].text_history.pop_front();
