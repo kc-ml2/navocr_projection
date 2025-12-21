@@ -29,19 +29,6 @@
 namespace navocr_projection
 {
 
-struct Detection
-{
-  int frame_id;
-  cv::Rect bbox;
-  double confidence;
-  std::string text;
-  rclcpp::Time timestamp;
-  double depth_m;
-  Eigen::Vector3d camera_pos;
-  Eigen::Vector3d world_pos;
-  bool has_world_pos;
-};
-
 struct Landmark
 {
   Eigen::Vector3d mean_position;       // Mean position (μ)
@@ -89,9 +76,11 @@ private:
                       double ocr_confidence);
   void updateRepresentativeText(Landmark & landmark);
   void checkAndMergeNewLandmark(size_t new_idx);
-  void mergeLandmarks();
   Eigen::Vector3d getCurrentRobotPosition();
   void saveLandmarks();
+  
+  // Helper function for marker visualization
+  std_msgs::msg::ColorRGBA getConfidenceColor(double confidence) const;
   
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr detection_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
@@ -115,10 +104,6 @@ private:
   nav_msgs::msg::Odometry::SharedPtr latest_odom_;
   const size_t buffer_size_ = 50;
   
-  std::vector<Detection> detections_;
-  int frame_count_;
-  int detection_count_;
-  
   std::vector<Landmark> landmarks_;
   int next_landmark_id_;
   
@@ -131,7 +116,15 @@ private:
   const double acceptance_threshold_;
   const int text_history_size_;
   
-  rclcpp::Time last_process_time_;
+  // Filtering thresholds (used for both visualization and saving)
+  const double min_confidence_for_output_;  // Minimum confidence for RViz & CSV
+  
+  // Visualization parameters (fixed at compile time)
+  const double marker_cube_size_;
+  const double marker_transparency_;
+  const double text_marker_height_;
+  const double confidence_threshold_high_;
+  const double confidence_threshold_medium_;
   
   template<typename T>
   typename std::map<rclcpp::Time, T>::iterator findClosestTimestamp(

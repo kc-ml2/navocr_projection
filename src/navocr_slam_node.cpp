@@ -10,13 +10,19 @@ namespace navocr_projection
 NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
 : Node("navocr_slam_cpp", options),
   camera_info_received_(false),
-  frame_count_(0),
-  detection_count_(0),
   next_landmark_id_(1),
-  chi2_threshold_(11.3),              // χ²(3, 0.99) - statistical constant
-  text_similarity_threshold_(0.3),    // 30% similarity - relaxed for OCR variability
-  acceptance_threshold_(0.5),         // 50% confidence - balanced threshold
-  text_history_size_(50)              // Sliding window size
+  // Statistical thresholds - optimized for 0.5x playback speed
+  // For 1.0x: chi2=11.3, text_sim=0.4, acceptance=0.5
+  chi2_threshold_(13.5),              // χ²(3, 0.99) relaxed - allow more spatial variance
+  text_similarity_threshold_(0.35),   // 35% similarity - more lenient for duplicate detection
+  acceptance_threshold_(0.55),        // 55% confidence - slightly stricter for merging
+  text_history_size_(50),             // Sliding window size
+  min_confidence_for_output_(0.25),   // 25% minimum confidence for display & save
+  marker_cube_size_(0.3),             // Marker cube size in meters
+  marker_transparency_(0.8),          // Marker alpha value (0.0-1.0)
+  text_marker_height_(0.5),           // Text marker height in meters
+  confidence_threshold_high_(0.7),    // High confidence threshold (green)
+  confidence_threshold_medium_(0.4)   // Medium confidence threshold (yellow)
 {
   // Declare essential parameters only
   this->declare_parameter("output_dir", "/home/sehyeon/ros2_ws/src/navocr_projection/results_cpp");
@@ -85,6 +91,7 @@ NavOCRSLAMNode::NavOCRSLAMNode(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(this->get_logger(), "  Chi² threshold: %.1f (fixed)", chi2_threshold_);
   RCLCPP_INFO(this->get_logger(), "  Text similarity threshold: %.2f (fixed)", text_similarity_threshold_);
   RCLCPP_INFO(this->get_logger(), "  Acceptance threshold: %.2f (fixed)", acceptance_threshold_);
+  RCLCPP_INFO(this->get_logger(), "  Min confidence for output: %.2f (RViz & CSV)", min_confidence_for_output_);
 }
 
 NavOCRSLAMNode::~NavOCRSLAMNode()
@@ -92,6 +99,32 @@ NavOCRSLAMNode::~NavOCRSLAMNode()
   RCLCPP_INFO(this->get_logger(), "Shutting down, saving data...");
   saveLandmarks();
   RCLCPP_INFO(this->get_logger(), "Shutdown complete. Total landmarks: %zu", landmarks_.size());
+}
+
+// Helper function to get color based on confidence level
+std_msgs::msg::ColorRGBA NavOCRSLAMNode::getConfidenceColor(double confidence) const
+{
+  std_msgs::msg::ColorRGBA color;
+  color.a = 1.0;  // Full opacity
+  
+  if (confidence >= confidence_threshold_high_) {
+    // High confidence: Green
+    color.r = 0.0;
+    color.g = 1.0;
+    color.b = 0.0;
+  } else if (confidence >= confidence_threshold_medium_) {
+    // Medium confidence: Yellow
+    color.r = 1.0;
+    color.g = 1.0;
+    color.b = 0.0;
+  } else {
+    // Low confidence: Orange
+    color.r = 1.0;
+    color.g = 0.5;
+    color.b = 0.0;
+  }
+  
+  return color;
 }
 
 void NavOCRSLAMNode::cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
@@ -149,10 +182,8 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
   rclcpp::Time detection_time(msg->header.stamp);
   auto depth_dt = std::abs((detection_time - depth_it->first).nanoseconds()) / 1e6;  // ms
   
-  frame_count_++;
-  
-  RCLCPP_INFO(this->get_logger(), "Frame %d: %zu detections (depth dt=%.1fms)", 
-              frame_count_, msg->detections.size(), depth_dt);
+  RCLCPP_INFO(this->get_logger(), "Processing %zu detections (depth dt=%.1fms)", 
+              msg->detections.size(), depth_dt);
   
   for (const auto & det : msg->detections) {
     if (det.results.empty()) continue;
@@ -162,11 +193,35 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     
     // Extract OCR label from class_id (PaddleOCR result)
     std::string label = det.results[0].hypothesis.class_id;
-    RCLCPP_INFO(this->get_logger(), "Received detection with class_id='%s'", label.c_str());
+    
+    // Text validation: filter out invalid OCR results
     if (label.empty()) {
-      label = "Unknown";
-      RCLCPP_WARN(this->get_logger(), "Empty class_id received, using 'Unknown'");
+      RCLCPP_DEBUG(this->get_logger(), "Skipping empty text detection");
+      continue;
     }
+    
+    // Remove leading/trailing whitespace
+    label.erase(0, label.find_first_not_of(" \t\n\r"));
+    label.erase(label.find_last_not_of(" \t\n\r") + 1);
+    
+    if (label.empty()) {
+      RCLCPP_DEBUG(this->get_logger(), "Skipping whitespace-only text");
+      continue;
+    }
+    
+    // Filter out too short text (likely noise)
+    if (label.length() < 2) {
+      RCLCPP_DEBUG(this->get_logger(), "Skipping too short text: '%s'", label.c_str());
+      continue;
+    }
+    
+    // Filter out too long text (likely OCR error)
+    if (label.length() > 50) {
+      RCLCPP_DEBUG(this->get_logger(), "Skipping too long text (len=%zu)", label.length());
+      continue;
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "Valid detection with text='%s' (conf=%.2f)", label.c_str(), confidence);
     
     // Get bounding box center
     int center_u = static_cast<int>(det.bbox.center.position.x);
@@ -181,13 +236,39 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
       size_y
     );
     
-    // Get depth from synchronized depth image
+    // Get depth from synchronized depth image (average around center for stability)
     double depth_m = 0.0;
-    if (center_v >= 0 && center_v < depth_image.rows && 
-        center_u >= 0 && center_u < depth_image.cols) {
-      uint16_t depth_mm = depth_image.at<uint16_t>(center_v, center_u);
-      depth_m = static_cast<double>(depth_mm) / 1000.0;
+    
+    // Define sampling window size (10x10 pixels around center)
+    const int window_size = 10;
+    const int half_window = window_size / 2;
+    
+    // Calculate sampling region boundaries (ensure within image bounds)
+    int u_start = std::max(0, center_u - half_window);
+    int u_end = std::min(depth_image.cols, center_u + half_window);
+    int v_start = std::max(0, center_v - half_window);
+    int v_end = std::min(depth_image.rows, center_v + half_window);
+    
+    // Extract ROI using OpenCV (vectorized operation - much faster)
+    cv::Rect roi(u_start, v_start, u_end - u_start, v_end - v_start);
+    cv::Mat depth_roi = depth_image(roi);
+    
+    // Create mask for valid depth values (100mm ~ 10000mm)
+    cv::Mat valid_mask = (depth_roi > 100) & (depth_roi < 10000);
+    
+    // Compute mean of valid pixels using OpenCV mean() - hardware optimized
+    cv::Scalar mean_depth = cv::mean(depth_roi, valid_mask);
+    int valid_count = cv::countNonZero(valid_mask);
+    
+    // Use average if enough valid pixels, otherwise skip
+    if (valid_count < (window_size * window_size / 4)) {
+      RCLCPP_DEBUG(this->get_logger(), 
+                   "Insufficient valid depth pixels (%d/%d) at (%d, %d)", 
+                   valid_count, window_size * window_size, center_u, center_v);
+      continue;  // Not enough valid depth data
     }
+    
+    depth_m = mean_depth[0] / 1000.0;  // Convert mm to m
     
     if (depth_m < 0.1 || depth_m > 10.0) {
       continue;  // Invalid depth
@@ -196,39 +277,22 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     // Project to 3D in camera frame
     Eigen::Vector3d point_in_camera_frame = projectTo3D(center_u, center_v, depth_m);
     
-    // Create detection
-    Detection detection;
-    detection.frame_id = frame_count_;
-    detection.bbox = bbox;
-    detection.confidence = confidence;
-    detection.text = label;  // Store OCR text from vision_msgs
-    detection.timestamp = msg->header.stamp;
-    detection.depth_m = depth_m;
-    detection.camera_pos = point_in_camera_frame;
-    detection.has_world_pos = false;
-    
-    // Transform to world frame
+    // Transform to world frame and add to landmark manager
     Eigen::Vector3d point_in_world_frame;
     if (transformToWorld(point_in_camera_frame, msg->header.stamp, point_in_world_frame)) {
-      detection.world_pos = point_in_world_frame;
-      detection.has_world_pos = true;
-      
       // Add to landmark manager (online clustering) with OCR confidence
       addObservationToLandmarks(point_in_world_frame, label, msg->header.stamp, confidence);
       
       RCLCPP_INFO(this->get_logger(),
-                  "Detection #%d at world pos (%.2f, %.2f, %.2f), depth=%.2fm, conf=%.2f, text='%s'",
-                  detection_count_, point_in_world_frame.x(), point_in_world_frame.y(), point_in_world_frame.z(), 
+                  "Detection at world pos (%.2f, %.2f, %.2f), depth=%.2fm, conf=%.2f, text='%s'",
+                  point_in_world_frame.x(), point_in_world_frame.y(), point_in_world_frame.z(), 
                   depth_m, confidence, label.c_str());
     } else {
-      RCLCPP_INFO(this->get_logger(),
-                  "Detection #%d at camera pos (%.2f, %.2f, %.2f), depth=%.2fm, conf=%.2f",
-                  detection_count_, point_in_camera_frame.x(), point_in_camera_frame.y(), point_in_camera_frame.z(), 
-                  depth_m, confidence);
+      RCLCPP_DEBUG(this->get_logger(),
+                   "Failed to transform to world frame: camera pos (%.2f, %.2f, %.2f), depth=%.2fm",
+                   point_in_camera_frame.x(), point_in_camera_frame.y(), point_in_camera_frame.z(), 
+                   depth_m);
     }
-    
-    detections_.push_back(detection);
-    detection_count_++;
   }
   
   // Removed: Periodic merging (5-second timer)
@@ -246,8 +310,13 @@ void NavOCRSLAMNode::publishMarkers()
   
   // Publish consolidated landmarks (not individual detections)
   for (const auto & lm : landmarks_) {
-    // Filter by minimum observations
+    // Filter 1: Minimum observations
     if (lm.observation_count < min_observations_) {
+      continue;
+    }
+    
+    // Filter 2: Minimum confidence (unified threshold)
+    if (lm.text_confidence < min_confidence_for_output_) {
       continue;
     }
     
@@ -265,26 +334,14 @@ void NavOCRSLAMNode::publishMarkers()
     marker.pose.position.z = lm.mean_position.z();
     marker.pose.orientation.w = 1.0;
     
-    // Size (0.3m cube - larger for better visibility)
-    marker.scale.x = 0.3;
-    marker.scale.y = 0.3;
-    marker.scale.z = 0.3;
+    // Size from member variable
+    marker.scale.x = marker_cube_size_;
+    marker.scale.y = marker_cube_size_;
+    marker.scale.z = marker_cube_size_;
     
-    // Color based on text confidence (green = high, yellow = medium, red = low)
-    if (lm.text_confidence > 0.7) {
-      marker.color.r = 0.0;
-      marker.color.g = 1.0;
-      marker.color.b = 0.0;
-    } else if (lm.text_confidence > 0.4) {
-      marker.color.r = 1.0;
-      marker.color.g = 1.0;
-      marker.color.b = 0.0;
-    } else {
-      marker.color.r = 1.0;
-      marker.color.g = 0.5;
-      marker.color.b = 0.0;
-    }
-    marker.color.a = 0.8;
+    // Set color based on confidence level using helper function
+    marker.color = getConfidenceColor(lm.text_confidence);
+    marker.color.a = marker_transparency_;
     
     marker.lifetime = rclcpp::Duration::from_seconds(0);  // Forever
     
@@ -298,7 +355,7 @@ void NavOCRSLAMNode::publishMarkers()
     text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     text_marker.action = visualization_msgs::msg::Marker::ADD;
     text_marker.pose = marker.pose;
-    text_marker.pose.position.z += 0.3;  // Above the cube
+    text_marker.pose.position.z += marker_cube_size_;  // Above the cube
     
     // Display representative text + confidence + observation count
     std::stringstream ss;
@@ -307,10 +364,12 @@ void NavOCRSLAMNode::publishMarkers()
        << lm.observation_count << ")";
     text_marker.text = ss.str();
     
-    text_marker.scale.z = 0.5;  // Text height (increased for better visibility, especially for Korean)
+    text_marker.scale.z = text_marker_height_;
+    
+    // White text for better contrast
     text_marker.color.r = 1.0;
     text_marker.color.g = 1.0;
-    text_marker.color.b = 1.0;  // White text (better contrast than yellow)
+    text_marker.color.b = 1.0;
     text_marker.color.a = 1.0;
     
     marker_array.markers.push_back(text_marker);
@@ -335,22 +394,22 @@ bool NavOCRSLAMNode::transformToWorld(const Eigen::Vector3d & point_in_camera_fr
                                        Eigen::Vector3d & point_in_world_frame)
 {
   try {
-    // Create PointStamped in camera frame
-    geometry_msgs::msg::PointStamped camera_point_msg;
-    camera_point_msg.header.frame_id = camera_frame_;
-    camera_point_msg.header.stamp = timestamp;
-    camera_point_msg.point.x = point_in_camera_frame.x();
-    camera_point_msg.point.y = point_in_camera_frame.y();
-    camera_point_msg.point.z = point_in_camera_frame.z();
+    // Create PointStamped message for detected text location in camera frame
+    geometry_msgs::msg::PointStamped detected_text_point_in_camera_frame_msg;
+    detected_text_point_in_camera_frame_msg.header.frame_id = camera_frame_;
+    detected_text_point_in_camera_frame_msg.header.stamp = timestamp;
+    detected_text_point_in_camera_frame_msg.point.x = point_in_camera_frame.x();
+    detected_text_point_in_camera_frame_msg.point.y = point_in_camera_frame.y();
+    detected_text_point_in_camera_frame_msg.point.z = point_in_camera_frame.z();
     
-    // Transform to world frame
-    geometry_msgs::msg::PointStamped world_point_msg;
-    world_point_msg = tf_buffer_->transform(camera_point_msg, world_frame_, 
-                                             tf2::durationFromSec(0.5));
+    // Transform detected text location to world frame
+    geometry_msgs::msg::PointStamped detected_text_point_in_world_frame_msg;
+    detected_text_point_in_world_frame_msg = tf_buffer_->transform(
+      detected_text_point_in_camera_frame_msg, world_frame_, tf2::durationFromSec(0.5));
     
-    point_in_world_frame.x() = world_point_msg.point.x;
-    point_in_world_frame.y() = world_point_msg.point.y;
-    point_in_world_frame.z() = world_point_msg.point.z;
+    point_in_world_frame.x() = detected_text_point_in_world_frame_msg.point.x;
+    point_in_world_frame.y() = detected_text_point_in_world_frame_msg.point.y;
+    point_in_world_frame.z() = detected_text_point_in_world_frame_msg.point.z;
     
     return true;
     
@@ -371,7 +430,8 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
                                                 double ocr_confidence)
 {
   // Step 1: Find candidate landmarks (geometric proximity)
-  std::vector<std::pair<int, double>> candidates;  // (index, score)
+  // Store: (index, combined_score, text_similarity) to avoid recalculation
+  std::vector<std::tuple<int, double, double>> candidates;  // (index, score, text_sim)
   
   for (size_t i = 0; i < landmarks_.size(); i++) {
     // Calculate Mahalanobis distance
@@ -379,14 +439,14 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
     
     // Chi-squared gate (99% confidence)
     if (d_squared < chi2_threshold_) {
-      // Calculate text similarity
+      // Calculate text similarity ONCE and cache it
       double text_sim = textSimilarity(text, landmarks_[i].representative_text);
       
       // Combined score: 90% geometry, 10% text (relaxed for OCR noise)
       double geo_score = 1.0 - (d_squared / chi2_threshold_);
       double final_score = 0.9 * geo_score + 0.1 * text_sim;
       
-      candidates.push_back({i, final_score});
+      candidates.push_back({i, final_score, text_sim});  // Store text_sim for reuse
     }
   }
   
@@ -394,18 +454,21 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
   if (!candidates.empty()) {
     // Find highest score
     auto best = std::max_element(candidates.begin(), candidates.end(),
-                                   [](const auto& a, const auto& b) { return a.second < b.second; });
+                                   [](const auto& candidate_a, const auto& candidate_b) { 
+                                     return std::get<1>(candidate_a) < std::get<1>(candidate_b); 
+                                   });
     
-    int best_idx = best->first;
-    double best_score = best->second;
+    int best_idx = std::get<0>(*best);
+    double best_score = std::get<1>(*best);
+    double cached_text_sim = std::get<2>(*best);  // Reuse cached similarity
     
     // Step 3: Accept or reject
     if (best_score > acceptance_threshold_) {
       // Update existing landmark
       updateLandmark(landmarks_[best_idx], world_pos, text, timestamp, ocr_confidence);
       RCLCPP_DEBUG(this->get_logger(), 
-                   "Observation '%s' (conf=%.2f) merged to Landmark #%d (score=%.2f)", 
-                   text.c_str(), ocr_confidence, landmarks_[best_idx].landmark_id, best_score);
+                   "Observation '%s' (conf=%.2f) merged to Landmark #%d (score=%.2f, text_sim=%.2f)", 
+                   text.c_str(), ocr_confidence, landmarks_[best_idx].landmark_id, best_score, cached_text_sim);
       return;
     }
   }
@@ -435,26 +498,45 @@ double NavOCRSLAMNode::levenshteinDistance(const std::string & s1, const std::st
   const size_t m = s1.size();
   const size_t n = s2.size();
   
+  // Base cases
   if (m == 0) return n;
   if (n == 0) return m;
   
-  std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1));
-  
-  for (size_t i = 0; i <= m; i++) dp[i][0] = i;
-  for (size_t j = 0; j <= n; j++) dp[0][j] = j;
-  
-  for (size_t i = 1; i <= m; i++) {
-    for (size_t j = 1; j <= n; j++) {
-      int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
-      dp[i][j] = std::min({
-        dp[i-1][j] + 1,      // deletion
-        dp[i][j-1] + 1,      // insertion
-        dp[i-1][j-1] + cost  // substitution
-      });
-    }
+  // Early termination: If length difference is too large, similarity will be low
+  // Skip expensive computation if difference > 60% of max length
+  size_t max_len = std::max(m, n);
+  if (std::abs(static_cast<int>(m) - static_cast<int>(n)) > static_cast<int>(max_len * 0.6)) {
+    return std::abs(static_cast<int>(m) - static_cast<int>(n));
   }
   
-  return dp[m][n];
+  // Space optimization: Use 1D rolling arrays instead of 2D (75% memory reduction)
+  // We only need the previous row to compute the current row
+  std::vector<int> prev_row(n + 1);
+  std::vector<int> curr_row(n + 1);
+  
+  // Initialize first row
+  for (size_t j = 0; j <= n; j++) {
+    prev_row[j] = j;
+  }
+  
+  // Compute edit distance using rolling arrays
+  for (size_t i = 1; i <= m; i++) {
+    curr_row[0] = i;  // First column
+    
+    for (size_t j = 1; j <= n; j++) {
+      int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
+      curr_row[j] = std::min({
+        prev_row[j] + 1,      // deletion
+        curr_row[j-1] + 1,    // insertion
+        prev_row[j-1] + cost  // substitution
+      });
+    }
+    
+    // Swap rows for next iteration (O(1) operation with pointers)
+    std::swap(prev_row, curr_row);
+  }
+  
+  return prev_row[n];  // Result is in prev_row after final swap
 }
 
 double NavOCRSLAMNode::textSimilarity(const std::string & s1, const std::string & s2)
@@ -541,8 +623,8 @@ void NavOCRSLAMNode::updateRepresentativeText(Landmark & landmark)
   
   // Find text with highest weighted score
   auto max_elem = std::max_element(weighted_scores.begin(), weighted_scores.end(),
-                                     [](const auto& a, const auto& b) { 
-                                       return a.second < b.second; 
+                                     [](const auto& text_score_pair_a, const auto& text_score_pair_b) { 
+                                       return text_score_pair_a.second < text_score_pair_b.second; 
                                      });
   
   landmark.representative_text = max_elem->first;
@@ -601,6 +683,9 @@ void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
   // Get current robot position for spatial filtering
   Eigen::Vector3d robot_pos = getCurrentRobotPosition();
   
+  // Calculate robot distance to new landmark ONCE (outside loop)
+  double robot_dist_new = (new_lm.mean_position - robot_pos).norm();
+  
   int candidates_checked = 0;
   int candidates_skipped = 0;
   
@@ -608,9 +693,11 @@ void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
   for (size_t i = 0; i < landmarks_.size(); i++) {
     if (i == new_idx) continue;  // Skip self
     
-    // Spatial filtering: Skip landmarks too far from robot
-    double dist_to_robot = (landmarks_[i].mean_position - robot_pos).norm();
-    if (dist_to_robot > merge_search_radius_) {
+    // Spatial filtering: Use pre-calculated robot_dist_new
+    double robot_dist_existing = (landmarks_[i].mean_position - robot_pos).norm();
+    
+    // Skip if distance difference exceeds search radius
+    if (std::abs(robot_dist_new - robot_dist_existing) > merge_search_radius_) {
       candidates_skipped++;
       continue;  // Skip distant landmarks
     }
@@ -626,8 +713,8 @@ void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
       double text_sim = textSimilarity(new_lm.representative_text, 
                                         landmarks_[i].representative_text);
       
-      // Merge criteria: text similarity > 0.3 (30%, relaxed for OCR noise)
-      if (text_sim > 0.3) {
+      // Merge criteria: text similarity > 0.4 (40%, balanced for OCR noise)
+      if (text_sim > 0.4) {
         // Merge new landmark into existing landmark i
         int total_N = landmarks_[i].observation_count + new_lm.observation_count;
         
@@ -667,53 +754,6 @@ void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
                new_lm.landmark_id, candidates_checked, candidates_skipped);
 }
 
-void NavOCRSLAMNode::mergeLandmarks()
-{
-  // NOTE: This function is no longer called automatically (real-time merging enabled)
-  // It can be used for manual cleanup if needed
-  
-  // Merge landmarks that are too close with similar text
-  for (size_t i = 0; i < landmarks_.size(); i++) {
-    for (size_t j = i + 1; j < landmarks_.size(); j++) {
-      double dist = (landmarks_[i].mean_position - landmarks_[j].mean_position).norm();
-      double text_sim = textSimilarity(landmarks_[i].representative_text, 
-                                        landmarks_[j].representative_text);
-      
-      // Merge criteria: close distance (< 1.0m) AND similar text (> 30%)
-      if (dist < 1.0 && text_sim > 0.3) {
-        // Merge j into i (keep one with more observations)
-        if (landmarks_[i].observation_count >= landmarks_[j].observation_count) {
-          // Combine observations
-          int total_N = landmarks_[i].observation_count + landmarks_[j].observation_count;
-          
-          // Weighted average of positions
-          landmarks_[i].mean_position = 
-            (landmarks_[i].mean_position * landmarks_[i].observation_count +
-             landmarks_[j].mean_position * landmarks_[j].observation_count) / total_N;
-          
-          landmarks_[i].observation_count = total_N;
-          
-          // Merge text histories (with confidence values)
-          for (const auto & text_conf_pair : landmarks_[j].text_history) {
-            landmarks_[i].text_history.push_back(text_conf_pair);
-          }
-          while (landmarks_[i].text_history.size() > static_cast<size_t>(text_history_size_)) {
-            landmarks_[i].text_history.pop_front();
-          }
-          
-          updateRepresentativeText(landmarks_[i]);
-          
-          // Remove j
-          landmarks_.erase(landmarks_.begin() + j);
-          j--;  // Adjust index after erase
-          
-          RCLCPP_INFO(this->get_logger(), "Merged landmarks (dist=%.2fm, sim=%.2f)", dist, text_sim);
-        }
-      }
-    }
-  }
-}
-
 void NavOCRSLAMNode::saveLandmarks()
 {
   if (landmarks_.empty()) {
@@ -741,8 +781,13 @@ void NavOCRSLAMNode::saveLandmarks()
   csv_file << std::fixed << std::setprecision(6);
   
   // Write data
+  int saved_count = 0;
   for (const auto & lm : landmarks_) {
-    if (lm.observation_count < min_observations_) continue;  // Skip weak landmarks
+    // Filter 1: Minimum observations
+    if (lm.observation_count < min_observations_) continue;
+    
+    // Filter 2: Minimum confidence (unified threshold)
+    if (lm.text_confidence < min_confidence_for_output_) continue;
     
     csv_file << lm.landmark_id << ","
              << lm.mean_position.x() << ","
@@ -751,12 +796,15 @@ void NavOCRSLAMNode::saveLandmarks()
              << lm.representative_text << ","
              << lm.text_confidence << ","
              << lm.observation_count << "\n";
+    saved_count++;
   }
   
   csv_file.close();
   
   RCLCPP_INFO(this->get_logger(), 
-              "Saved %zu landmarks to %s", landmarks_.size(), csv_path.c_str());
+              "Saved %d/%zu landmarks to %s (filtered by N>=%d and conf>=%.2f)", 
+              saved_count, landmarks_.size(), csv_path.c_str(), 
+              min_observations_, min_confidence_for_output_);
 }
 
 }  // namespace navocr_projection

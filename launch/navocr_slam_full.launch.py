@@ -80,6 +80,8 @@ def generate_launch_description():
         ),
         
         # 5. NavOCR-SLAM C++ 노드 (Landmark clustering)
+        # NOTE: Parameters optimized for 0.5x playback speed
+        # For 1.0x speed, use: sensor_noise=0.3, min_obs=3, merge_radius=10.0
         Node(
             package='navocr_projection',
             executable='navocr_slam_cpp',
@@ -90,8 +92,9 @@ def generate_launch_description():
                 'confidence_threshold': 0.3,
                 'camera_frame': 'camera_infra1_optical_frame',
                 'world_frame': 'map',  # rtabmap이 생성하는 map frame 사용
-                'sensor_noise_std': 0.3,
-                'min_observations': 3,
+                'sensor_noise_std': 0.35,       # 0.3 → 0.35 (slower playback = more uncertainty)
+                'min_observations': 4,          # 3 → 4 (require more consistent observations)
+                'merge_search_radius': 11.0,    # 10.0 → 11.0 (wider search for duplicates)
                 'use_sim_time': True,
             }]
         ),
