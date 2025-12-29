@@ -29,6 +29,17 @@
 namespace navocr_projection
 {
 
+struct Observation
+{
+  rclcpp::Time timestamp;
+  Eigen::Vector3d camera_position;
+  Eigen::Quaterniond camera_orientation;
+  double bbox_center_u;
+  double bbox_center_v;
+  int bbox_size_x;
+  int bbox_size_y;
+};
+
 struct Landmark
 {
   Eigen::Vector3d mean_position;       // Mean position (μ)
@@ -39,8 +50,10 @@ struct Landmark
   double text_confidence;              // Confidence in text (0-1)
   rclcpp::Time last_updated;           // Last observation time
   int landmark_id;                     // Unique ID
-  
-  Landmark() 
+
+  std::vector<Observation> observations;  // Store all observations for reprojection error
+
+  Landmark()
     : mean_position(Eigen::Vector3d::Zero()),
       covariance(Eigen::Matrix3d::Identity()),
       observation_count(0),
@@ -65,19 +78,27 @@ private:
                         Eigen::Vector3d & point_in_world_frame);
   void publishMarkers();
   
-  void addObservationToLandmarks(const Eigen::Vector3d & world_pos, const std::string & text, 
-                                  const rclcpp::Time & timestamp, double ocr_confidence);
+  void addObservationToLandmarks(const Eigen::Vector3d & world_pos, const std::string & text,
+                                  const rclcpp::Time & timestamp, double ocr_confidence,
+                                  double bbox_center_u, double bbox_center_v,
+                                  int bbox_size_x, int bbox_size_y);
   double mahalanobisDistance(const Eigen::Vector3d & point, const Landmark & landmark);
   double levenshteinDistance(const std::string & s1, const std::string & s2);
   double textSimilarity(const std::string & s1, const std::string & s2);
   void updateLandmark(Landmark & landmark, const Eigen::Vector3d & new_pos, const std::string & new_text,
-                      const rclcpp::Time & timestamp, double ocr_confidence);
+                      const rclcpp::Time & timestamp, double ocr_confidence,
+                      double bbox_center_u, double bbox_center_v,
+                      int bbox_size_x, int bbox_size_y);
   void createLandmark(const Eigen::Vector3d & pos, const std::string & text, const rclcpp::Time & timestamp,
                       double ocr_confidence);
   void updateRepresentativeText(Landmark & landmark);
   void checkAndMergeNewLandmark(size_t new_idx);
   Eigen::Vector3d getCurrentRobotPosition();
   void saveLandmarks();
+
+  // Reprojection error calculation
+  void computeReprojectionErrors();
+  void saveReprojectionSummary();
   
   // Helper function for marker visualization
   std_msgs::msg::ColorRGBA getConfidenceColor(double confidence) const;

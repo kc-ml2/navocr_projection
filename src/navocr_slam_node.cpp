@@ -98,6 +98,7 @@ NavOCRSLAMNode::~NavOCRSLAMNode()
 {
   RCLCPP_INFO(this->get_logger(), "Shutting down, saving data...");
   saveLandmarks();
+  saveReprojectionSummary();
   RCLCPP_INFO(this->get_logger(), "Shutdown complete. Total landmarks: %zu", landmarks_.size());
 }
 
@@ -280,12 +281,13 @@ void NavOCRSLAMNode::detectionCallback(const vision_msgs::msg::Detection2DArray:
     // Transform to world frame and add to landmark manager
     Eigen::Vector3d point_in_world_frame;
     if (transformToWorld(point_in_camera_frame, msg->header.stamp, point_in_world_frame)) {
-      // Add to landmark manager (online clustering) with OCR confidence
-      addObservationToLandmarks(point_in_world_frame, label, msg->header.stamp, confidence);
-      
+      // Add to landmark manager (online clustering) with OCR confidence and bbox info
+      addObservationToLandmarks(point_in_world_frame, label, msg->header.stamp, confidence,
+                                center_u, center_v, size_x, size_y);
+
       RCLCPP_INFO(this->get_logger(),
                   "Detection at world pos (%.2f, %.2f, %.2f), depth=%.2fm, conf=%.2f, text='%s'",
-                  point_in_world_frame.x(), point_in_world_frame.y(), point_in_world_frame.z(), 
+                  point_in_world_frame.x(), point_in_world_frame.y(), point_in_world_frame.z(),
                   depth_m, confidence, label.c_str());
     } else {
       RCLCPP_DEBUG(this->get_logger(),
@@ -424,59 +426,62 @@ bool NavOCRSLAMNode::transformToWorld(const Eigen::Vector3d & point_in_camera_fr
 // Landmark Management Functions
 // ========================================================================
 
-void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos, 
+void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos,
                                                 const std::string & text,
                                                 const rclcpp::Time & timestamp,
-                                                double ocr_confidence)
+                                                double ocr_confidence,
+                                                double bbox_center_u, double bbox_center_v,
+                                                int bbox_size_x, int bbox_size_y)
 {
   // Step 1: Find candidate landmarks (geometric proximity)
   // Store: (index, combined_score, text_similarity) to avoid recalculation
   std::vector<std::tuple<int, double, double>> candidates;  // (index, score, text_sim)
-  
+
   for (size_t i = 0; i < landmarks_.size(); i++) {
     // Calculate Mahalanobis distance
     double d_squared = mahalanobisDistance(world_pos, landmarks_[i]);
-    
+
     // Chi-squared gate (99% confidence)
     if (d_squared < chi2_threshold_) {
       // Calculate text similarity ONCE and cache it
       double text_sim = textSimilarity(text, landmarks_[i].representative_text);
-      
+
       // Combined score: 90% geometry, 10% text (relaxed for OCR noise)
       double geo_score = 1.0 - (d_squared / chi2_threshold_);
       double final_score = 0.9 * geo_score + 0.1 * text_sim;
-      
+
       candidates.push_back({i, final_score, text_sim});  // Store text_sim for reuse
     }
   }
-  
+
   // Step 2: Select best candidate
   if (!candidates.empty()) {
     // Find highest score
     auto best = std::max_element(candidates.begin(), candidates.end(),
-                                   [](const auto& candidate_a, const auto& candidate_b) { 
-                                     return std::get<1>(candidate_a) < std::get<1>(candidate_b); 
+                                   [](const auto& candidate_a, const auto& candidate_b) {
+                                     return std::get<1>(candidate_a) < std::get<1>(candidate_b);
                                    });
-    
+
     int best_idx = std::get<0>(*best);
     double best_score = std::get<1>(*best);
     double cached_text_sim = std::get<2>(*best);  // Reuse cached similarity
-    
+
     // Step 3: Accept or reject
     if (best_score > acceptance_threshold_) {
       // Update existing landmark
-      updateLandmark(landmarks_[best_idx], world_pos, text, timestamp, ocr_confidence);
-      RCLCPP_DEBUG(this->get_logger(), 
-                   "Observation '%s' (conf=%.2f) merged to Landmark #%d (score=%.2f, text_sim=%.2f)", 
+      updateLandmark(landmarks_[best_idx], world_pos, text, timestamp, ocr_confidence,
+                     bbox_center_u, bbox_center_v, bbox_size_x, bbox_size_y);
+      RCLCPP_DEBUG(this->get_logger(),
+                   "Observation '%s' (conf=%.2f) merged to Landmark #%d (score=%.2f, text_sim=%.2f)",
                    text.c_str(), ocr_confidence, landmarks_[best_idx].landmark_id, best_score, cached_text_sim);
       return;
     }
   }
-  
+
   // Step 4: Create new landmark if no match
   createLandmark(world_pos, text, timestamp, ocr_confidence);
-  RCLCPP_INFO(this->get_logger(), 
-              "New landmark #%d created for '%s' (conf=%.2f) at (%.2f, %.2f, %.2f)", 
+  RCLCPP_INFO(this->get_logger(),
+              "New landmark #%d created for '%s' (conf=%.2f) at (%.2f, %.2f, %.2f)",
               next_landmark_id_ - 1, text.c_str(), ocr_confidence, world_pos.x(), world_pos.y(), world_pos.z());
 }
 
@@ -549,34 +554,81 @@ double NavOCRSLAMNode::textSimilarity(const std::string & s1, const std::string 
   return 1.0 - (dist / max_len);
 }
 
-void NavOCRSLAMNode::updateLandmark(Landmark & landmark, 
+void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
                                      const Eigen::Vector3d & new_pos,
                                      const std::string & new_text,
                                      const rclcpp::Time & timestamp,
-                                     double ocr_confidence)
+                                     double ocr_confidence,
+                                     double bbox_center_u, double bbox_center_v,
+                                     int bbox_size_x, int bbox_size_y)
 {
   // Welford's online algorithm for mean update
   landmark.observation_count++;
   int N = landmark.observation_count;
-  
+
   Eigen::Vector3d delta = new_pos - landmark.mean_position;
-  
+
   // Update mean: μ_new = μ_old + δ/N
   landmark.mean_position += delta / N;
-  
+
   // Simple covariance update (could use Welford's for variance too)
   // For now, keep initial covariance or use simple moving average
-  
+
   // Add text to history (sliding window) with OCR confidence
   landmark.text_history.push_back({new_text, ocr_confidence});
   if (landmark.text_history.size() > static_cast<size_t>(text_history_size_)) {
     landmark.text_history.pop_front();
   }
-  
+
   // Update representative text (weighted by confidence)
   updateRepresentativeText(landmark);
-  
+
   landmark.last_updated = timestamp;
+
+  // Store observation for reprojection error calculation
+  Observation obs;
+  obs.timestamp = timestamp;
+
+  // Get camera pose from TF
+  try {
+    auto transform = tf_buffer_->lookupTransform(world_frame_, camera_frame_, timestamp, tf2::durationFromSec(0.1));
+    obs.camera_position = Eigen::Vector3d(
+      transform.transform.translation.x,
+      transform.transform.translation.y,
+      transform.transform.translation.z
+    );
+    obs.camera_orientation = Eigen::Quaterniond(
+      transform.transform.rotation.w,
+      transform.transform.rotation.x,
+      transform.transform.rotation.y,
+      transform.transform.rotation.z
+    );
+  } catch (tf2::TransformException & ex) {
+    // Fallback: use latest odom if TF fails
+    if (latest_odom_) {
+      obs.camera_position = Eigen::Vector3d(
+        latest_odom_->pose.pose.position.x,
+        latest_odom_->pose.pose.position.y,
+        latest_odom_->pose.pose.position.z
+      );
+      obs.camera_orientation = Eigen::Quaterniond(
+        latest_odom_->pose.pose.orientation.w,
+        latest_odom_->pose.pose.orientation.x,
+        latest_odom_->pose.pose.orientation.y,
+        latest_odom_->pose.pose.orientation.z
+      );
+    } else {
+      // Skip observation if no pose available
+      return;
+    }
+  }
+
+  obs.bbox_center_u = bbox_center_u;
+  obs.bbox_center_v = bbox_center_v;
+  obs.bbox_size_x = bbox_size_x;
+  obs.bbox_size_y = bbox_size_y;
+
+  landmark.observations.push_back(obs);
 }
 
 void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos, 
@@ -801,10 +853,210 @@ void NavOCRSLAMNode::saveLandmarks()
   
   csv_file.close();
   
-  RCLCPP_INFO(this->get_logger(), 
-              "Saved %d/%zu landmarks to %s (filtered by N>=%d and conf>=%.2f)", 
-              saved_count, landmarks_.size(), csv_path.c_str(), 
+  RCLCPP_INFO(this->get_logger(),
+              "Saved %d/%zu landmarks to %s (filtered by N>=%d and conf>=%.2f)",
+              saved_count, landmarks_.size(), csv_path.c_str(),
               min_observations_, min_confidence_for_output_);
+}
+
+// ========================================================================
+// Reprojection Error Calculation Functions
+// ========================================================================
+
+void NavOCRSLAMNode::computeReprojectionErrors()
+{
+  std::string error_file = output_dir_ + "/NavOCR_reprojection_error.txt";
+  std::ofstream outfile(error_file);
+
+  if (!outfile.is_open()) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to open %s", error_file.c_str());
+    return;
+  }
+
+  outfile << "# NavOCR Reprojection Error Data" << std::endl;
+  outfile << "# Format: landmark_id,text,timestamp,error_px" << std::endl;
+
+  int total_observations = 0;
+
+  for (const auto& lm : landmarks_) {
+    // Filter: only valid landmarks
+    if (lm.observation_count < min_observations_) continue;
+    if (lm.text_confidence < min_confidence_for_output_) continue;
+
+    // For each observation, compute reprojection error
+    for (const auto& obs : lm.observations) {
+      // Transform landmark to camera frame
+      Eigen::Vector3d P_world = lm.mean_position;
+
+      // World to camera transform
+      Eigen::Matrix3d R_world_to_camera = obs.camera_orientation.toRotationMatrix().transpose();
+      Eigen::Vector3d t_world_to_camera = -R_world_to_camera * obs.camera_position;
+
+      Eigen::Vector3d P_camera = R_world_to_camera * P_world + t_world_to_camera;
+
+      // Check if in front of camera
+      if (P_camera.z() <= 0) continue;
+
+      // Project to image
+      double u_proj = fx_ * P_camera.x() / P_camera.z() + cx_;
+      double v_proj = fy_ * P_camera.y() / P_camera.z() + cy_;
+
+      // Get detected center
+      double u_det = obs.bbox_center_u;
+      double v_det = obs.bbox_center_v;
+
+      // Compute reprojection error
+      double error = std::sqrt((u_proj - u_det) * (u_proj - u_det) +
+                              (v_proj - v_det) * (v_proj - v_det));
+
+      // Record
+      outfile << lm.landmark_id << ",\"" << lm.representative_text << "\","
+              << obs.timestamp.nanoseconds() / 1e9 << "," << error << std::endl;
+
+      total_observations++;
+    }
+  }
+
+  outfile.close();
+
+  RCLCPP_INFO(this->get_logger(),
+              "Computed reprojection errors for %d observations across %zu landmarks",
+              total_observations, landmarks_.size());
+  RCLCPP_INFO(this->get_logger(), "Saved to %s", error_file.c_str());
+}
+
+void NavOCRSLAMNode::saveReprojectionSummary()
+{
+  // First, compute reprojection errors
+  computeReprojectionErrors();
+
+  // Read and parse the error file
+  std::string error_file = output_dir_ + "/NavOCR_reprojection_error.txt";
+  std::ifstream infile(error_file);
+
+  if (!infile.is_open()) {
+    RCLCPP_WARN(this->get_logger(), "Could not open %s for summary generation", error_file.c_str());
+    return;
+  }
+
+  std::map<int, std::vector<double>> landmark_errors;  // landmark_id -> errors
+  std::map<int, std::string> landmark_texts;
+  std::string line;
+
+  while (std::getline(infile, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    // Parse CSV: landmark_id,text,timestamp,error
+    std::istringstream iss(line);
+    std::string id_str, text, timestamp_str, error_str;
+
+    std::getline(iss, id_str, ',');
+    std::getline(iss, text, ',');
+    std::getline(iss, timestamp_str, ',');
+    std::getline(iss, error_str, ',');
+
+    // Remove quotes from text
+    if (text.front() == '"') text = text.substr(1, text.length() - 2);
+
+    int landmark_id = std::stoi(id_str);
+    double error = std::stod(error_str);
+
+    landmark_errors[landmark_id].push_back(error);
+    landmark_texts[landmark_id] = text;
+  }
+  infile.close();
+
+  // Compute statistics
+  std::string summary_file = output_dir_ + "/NavOCR_reprojection_summary.txt";
+  std::ofstream summary(summary_file);
+
+  summary << "=== NavOCR Reprojection Error Summary ===" << std::endl << std::endl;
+  summary << "landmark_id,text,num_observations,mean_error,std_error,min_error,max_error" << std::endl;
+
+  std::vector<double> all_errors;
+  std::vector<double> weighted_errors;
+  std::vector<double> weights;
+
+  for (const auto& pair : landmark_errors) {
+    int landmark_id = pair.first;
+    const std::vector<double>& errors = pair.second;
+
+    if (errors.empty()) continue;
+
+    // Statistics
+    double mean_error = std::accumulate(errors.begin(), errors.end(), 0.0) / errors.size();
+
+    double std_error = 0.0;
+    for (double e : errors) std_error += (e - mean_error) * (e - mean_error);
+    std_error = std::sqrt(std_error / errors.size());
+
+    double min_error = *std::min_element(errors.begin(), errors.end());
+    double max_error = *std::max_element(errors.begin(), errors.end());
+
+    summary << landmark_id << ",\"" << landmark_texts[landmark_id] << "\","
+            << errors.size() << "," << mean_error << "," << std_error << ","
+            << min_error << "," << max_error << std::endl;
+
+    // Accumulate
+    for (double e : errors) all_errors.push_back(e);
+
+    double weight = std::sqrt(static_cast<double>(errors.size()));
+    weighted_errors.push_back(mean_error);
+    weights.push_back(weight);
+  }
+
+  // Global statistics
+  summary << std::endl << "=== Global Statistics ===" << std::endl;
+
+  double global_mean = std::accumulate(all_errors.begin(), all_errors.end(), 0.0) / all_errors.size();
+
+  double weighted_mean = 0.0, total_weight = 0.0;
+  for (size_t i = 0; i < weighted_errors.size(); i++) {
+    weighted_mean += weighted_errors[i] * weights[i];
+    total_weight += weights[i];
+  }
+  weighted_mean /= total_weight;
+
+  // Histogram
+  std::vector<int> histogram(8, 0);
+  for (double e : all_errors) {
+    if (e < 1) histogram[0]++;
+    else if (e < 2) histogram[1]++;
+    else if (e < 3) histogram[2]++;
+    else if (e < 4) histogram[3]++;
+    else if (e < 5) histogram[4]++;
+    else if (e < 7) histogram[5]++;
+    else if (e < 10) histogram[6]++;
+    else histogram[7]++;
+  }
+
+  summary << "Total observations: " << all_errors.size() << std::endl;
+  summary << "Total landmarks: " << landmark_errors.size() << std::endl;
+  summary << "Overall mean error: " << global_mean << " pixels" << std::endl;
+  summary << "Weighted mean error: " << weighted_mean << " pixels (weighted by sqrt(num_obs))" << std::endl;
+
+  summary << std::endl << "=== Error Distribution ===" << std::endl;
+  summary << "0-1 px:   " << histogram[0] << " (" << (100.0*histogram[0]/all_errors.size()) << "%)" << std::endl;
+  summary << "1-2 px:   " << histogram[1] << " (" << (100.0*histogram[1]/all_errors.size()) << "%)" << std::endl;
+  summary << "2-3 px:   " << histogram[2] << " (" << (100.0*histogram[2]/all_errors.size()) << "%)" << std::endl;
+  summary << "3-4 px:   " << histogram[3] << " (" << (100.0*histogram[3]/all_errors.size()) << "%)" << std::endl;
+  summary << "4-5 px:   " << histogram[4] << " (" << (100.0*histogram[4]/all_errors.size()) << "%)" << std::endl;
+  summary << "5-7 px:   " << histogram[5] << " (" << (100.0*histogram[5]/all_errors.size()) << "%)" << std::endl;
+  summary << "7-10 px:  " << histogram[6] << " (" << (100.0*histogram[6]/all_errors.size()) << "%)" << std::endl;
+  summary << ">10 px:   " << histogram[7] << " (" << (100.0*histogram[7]/all_errors.size()) << "%)" << std::endl;
+
+  int cumulative_3px = histogram[0] + histogram[1] + histogram[2];
+  int cumulative_5px = cumulative_3px + histogram[3] + histogram[4];
+  summary << std::endl << "Cumulative (<=3px): " << (100.0*cumulative_3px/all_errors.size()) << "%" << std::endl;
+  summary << "Cumulative (<=5px): " << (100.0*cumulative_5px/all_errors.size()) << "%" << std::endl;
+
+  summary.close();
+
+  RCLCPP_INFO(this->get_logger(), "=== NavOCR Reprojection Error Summary ===");
+  RCLCPP_INFO(this->get_logger(), "Total observations: %zu", all_errors.size());
+  RCLCPP_INFO(this->get_logger(), "Total landmarks: %zu", landmark_errors.size());
+  RCLCPP_INFO(this->get_logger(), "Weighted mean error: %.2f pixels", weighted_mean);
+  RCLCPP_INFO(this->get_logger(), "Summary saved to %s", summary_file.c_str());
 }
 
 }  // namespace navocr_projection
