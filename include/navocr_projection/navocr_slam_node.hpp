@@ -38,6 +38,7 @@ struct Observation
   double bbox_center_v;
   int bbox_size_x;
   int bbox_size_y;
+  double reprojection_error;  // Pre-calculated reprojection error in pixels
 };
 
 struct Landmark
@@ -90,7 +91,9 @@ private:
                       double bbox_center_u, double bbox_center_v,
                       int bbox_size_x, int bbox_size_y);
   void createLandmark(const Eigen::Vector3d & pos, const std::string & text, const rclcpp::Time & timestamp,
-                      double ocr_confidence);
+                      double ocr_confidence,
+                      double bbox_center_u, double bbox_center_v,
+                      int bbox_size_x, int bbox_size_y);
   void updateRepresentativeText(Landmark & landmark);
   void checkAndMergeNewLandmark(size_t new_idx);
   Eigen::Vector3d getCurrentRobotPosition();

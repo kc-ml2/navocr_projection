@@ -479,7 +479,8 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
   }
 
   // Step 4: Create new landmark if no match
-  createLandmark(world_pos, text, timestamp, ocr_confidence);
+  createLandmark(world_pos, text, timestamp, ocr_confidence,
+                 bbox_center_u, bbox_center_v, bbox_size_x, bbox_size_y);
   RCLCPP_INFO(this->get_logger(),
               "New landmark #%d created for '%s' (conf=%.2f) at (%.2f, %.2f, %.2f)",
               next_landmark_id_ - 1, text.c_str(), ocr_confidence, world_pos.x(), world_pos.y(), world_pos.z());
@@ -628,33 +629,117 @@ void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
   obs.bbox_size_x = bbox_size_x;
   obs.bbox_size_y = bbox_size_y;
 
+  // Calculate reprojection error immediately (online calculation)
+  // Transform landmark position to camera frame
+  Eigen::Matrix3d R_world_to_camera = obs.camera_orientation.toRotationMatrix().transpose();
+  Eigen::Vector3d t_world_to_camera = -R_world_to_camera * obs.camera_position;
+  Eigen::Vector3d P_camera = R_world_to_camera * landmark.mean_position + t_world_to_camera;
+
+  // Calculate reprojection error if landmark is in front of camera
+  if (P_camera.z() > 0) {
+    // Project to image plane
+    double u_proj = fx_ * P_camera.x() / P_camera.z() + cx_;
+    double v_proj = fy_ * P_camera.y() / P_camera.z() + cy_;
+
+    // Compute reprojection error
+    obs.reprojection_error = std::sqrt((u_proj - bbox_center_u) * (u_proj - bbox_center_u) +
+                                       (v_proj - bbox_center_v) * (v_proj - bbox_center_v));
+  } else {
+    // Landmark behind camera - set invalid error
+    obs.reprojection_error = -1.0;
+  }
+
   landmark.observations.push_back(obs);
 }
 
-void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos, 
+void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos,
                                      const std::string & text,
                                      const rclcpp::Time & timestamp,
-                                     double ocr_confidence)
+                                     double ocr_confidence,
+                                     double bbox_center_u, double bbox_center_v,
+                                     int bbox_size_x, int bbox_size_y)
 {
   Landmark lm;
   lm.mean_position = pos;
   lm.observation_count = 1;
   lm.landmark_id = next_landmark_id_++;
   lm.last_updated = timestamp;
-  
+
   // Initial covariance based on sensor noise
   double var = sensor_noise_std_ * sensor_noise_std_;
   lm.covariance = Eigen::Matrix3d::Identity();
   lm.covariance(0, 0) = var;
   lm.covariance(1, 1) = var;
   lm.covariance(2, 2) = var * 9.0;  // z-axis (depth) has 3x more noise
-  
+
   lm.text_history.push_back({text, ocr_confidence});
   lm.representative_text = text;
   lm.text_confidence = ocr_confidence;  // Initial confidence from OCR
-  
+
+  // Store initial observation for reprojection error calculation
+  Observation obs;
+  obs.timestamp = timestamp;
+
+  // Get camera pose from TF
+  try {
+    auto transform = tf_buffer_->lookupTransform(world_frame_, camera_frame_, timestamp, tf2::durationFromSec(0.1));
+    obs.camera_position = Eigen::Vector3d(
+      transform.transform.translation.x,
+      transform.transform.translation.y,
+      transform.transform.translation.z
+    );
+    obs.camera_orientation = Eigen::Quaterniond(
+      transform.transform.rotation.w,
+      transform.transform.rotation.x,
+      transform.transform.rotation.y,
+      transform.transform.rotation.z
+    );
+  } catch (tf2::TransformException & ex) {
+    // Fallback: use latest odom if TF fails
+    if (latest_odom_) {
+      obs.camera_position = Eigen::Vector3d(
+        latest_odom_->pose.pose.position.x,
+        latest_odom_->pose.pose.position.y,
+        latest_odom_->pose.pose.position.z
+      );
+      obs.camera_orientation = Eigen::Quaterniond(
+        latest_odom_->pose.pose.orientation.w,
+        latest_odom_->pose.pose.orientation.x,
+        latest_odom_->pose.pose.orientation.y,
+        latest_odom_->pose.pose.orientation.z
+      );
+    } else {
+      // Cannot get camera pose - create landmark without observation
+      RCLCPP_WARN(this->get_logger(), "Cannot get camera pose for initial observation of landmark #%d", lm.landmark_id);
+      landmarks_.push_back(lm);
+      checkAndMergeNewLandmark(landmarks_.size() - 1);
+      return;
+    }
+  }
+
+  obs.bbox_center_u = bbox_center_u;
+  obs.bbox_center_v = bbox_center_v;
+  obs.bbox_size_x = bbox_size_x;
+  obs.bbox_size_y = bbox_size_y;
+
+  // Calculate reprojection error immediately (online calculation)
+  Eigen::Matrix3d R_world_to_camera = obs.camera_orientation.toRotationMatrix().transpose();
+  Eigen::Vector3d t_world_to_camera = -R_world_to_camera * obs.camera_position;
+  Eigen::Vector3d P_camera = R_world_to_camera * lm.mean_position + t_world_to_camera;
+
+  if (P_camera.z() > 0) {
+    double u_proj = fx_ * P_camera.x() / P_camera.z() + cx_;
+    double v_proj = fy_ * P_camera.y() / P_camera.z() + cy_;
+    obs.reprojection_error = std::sqrt((u_proj - bbox_center_u) * (u_proj - bbox_center_u) +
+                                       (v_proj - bbox_center_v) * (v_proj - bbox_center_v));
+  } else {
+    obs.reprojection_error = -1.0;
+  }
+
+  lm.observations.push_back(obs);
+
   landmarks_.push_back(lm);
-  
+
   // Immediately check if this new landmark should merge with existing ones
   checkAndMergeNewLandmark(landmarks_.size() - 1);
 }
@@ -883,35 +968,14 @@ void NavOCRSLAMNode::computeReprojectionErrors()
     if (lm.observation_count < min_observations_) continue;
     if (lm.text_confidence < min_confidence_for_output_) continue;
 
-    // For each observation, compute reprojection error
+    // For each observation, use pre-calculated reprojection error
     for (const auto& obs : lm.observations) {
-      // Transform landmark to camera frame
-      Eigen::Vector3d P_world = lm.mean_position;
+      // Skip invalid observations (landmark was behind camera)
+      if (obs.reprojection_error < 0) continue;
 
-      // World to camera transform
-      Eigen::Matrix3d R_world_to_camera = obs.camera_orientation.toRotationMatrix().transpose();
-      Eigen::Vector3d t_world_to_camera = -R_world_to_camera * obs.camera_position;
-
-      Eigen::Vector3d P_camera = R_world_to_camera * P_world + t_world_to_camera;
-
-      // Check if in front of camera
-      if (P_camera.z() <= 0) continue;
-
-      // Project to image
-      double u_proj = fx_ * P_camera.x() / P_camera.z() + cx_;
-      double v_proj = fy_ * P_camera.y() / P_camera.z() + cy_;
-
-      // Get detected center
-      double u_det = obs.bbox_center_u;
-      double v_det = obs.bbox_center_v;
-
-      // Compute reprojection error
-      double error = std::sqrt((u_proj - u_det) * (u_proj - u_det) +
-                              (v_proj - v_det) * (v_proj - v_det));
-
-      // Record
+      // Write pre-calculated error to file
       outfile << lm.landmark_id << ",\"" << lm.representative_text << "\","
-              << obs.timestamp.nanoseconds() / 1e9 << "," << error << std::endl;
+              << obs.timestamp.nanoseconds() / 1e9 << "," << obs.reprojection_error << std::endl;
 
       total_observations++;
     }
@@ -920,7 +984,7 @@ void NavOCRSLAMNode::computeReprojectionErrors()
   outfile.close();
 
   RCLCPP_INFO(this->get_logger(),
-              "Computed reprojection errors for %d observations across %zu landmarks",
+              "Wrote %d pre-calculated reprojection errors across %zu landmarks",
               total_observations, landmarks_.size());
   RCLCPP_INFO(this->get_logger(), "Saved to %s", error_file.c_str());
 }

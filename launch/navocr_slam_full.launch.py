@@ -15,8 +15,8 @@ def generate_launch_description():
     
     # Get directories
     home_dir = os.path.expanduser('~')
-    output_dir = os.path.join(home_dir, 'workspace', 'src', 'navocr_projection', 'results_cpp')
-    navocr_script = os.path.join(home_dir, 'workspace', 'src', 'NavOCR', 'run_navocr_ros_with_ocr.py')
+    output_dir = os.path.join(home_dir, 'ros2_ws', 'src', 'navocr_projection', 'results_cpp')
+    navocr_script = os.path.join(home_dir, 'ros2_ws', 'src', 'NavOCR', 'run_navocr_ros_with_ocr.py')
     
     # rtabmap 파라미터
     rtabmap_parameters = [{
@@ -74,7 +74,7 @@ def generate_launch_description():
         
         # 4. NavOCR Python 스크립트 (OCR detection)
         ExecuteProcess(
-            cmd=['python3', navocr_script],
+            cmd=['/home/sehyeon/miniconda3/envs/navocr/bin/python3.10', navocr_script],
             output='screen',
             shell=False
         ),
