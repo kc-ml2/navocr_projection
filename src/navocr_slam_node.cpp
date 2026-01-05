@@ -370,10 +370,10 @@ void NavOCRSLAMNode::publishMarkers()
     
     text_marker.scale.z = text_marker_height_;
     
-    // White text for better contrast
-    text_marker.color.r = 1.0;
-    text_marker.color.g = 1.0;
-    text_marker.color.b = 1.0;
+    // black text for white background
+    text_marker.color.r = 0.0;
+    text_marker.color.g = 0.0;
+    text_marker.color.b = 0.0;
     text_marker.color.a = 1.0;
     
     marker_array.markers.push_back(text_marker);
