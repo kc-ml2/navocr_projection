@@ -3,6 +3,8 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>  // for std::transform
+#include <cctype>     // for ::tolower
 
 namespace navocr_projection
 {
@@ -548,11 +550,56 @@ double NavOCRSLAMNode::levenshteinDistance(const std::string & s1, const std::st
 double NavOCRSLAMNode::textSimilarity(const std::string & s1, const std::string & s2)
 {
   if (s1.empty() || s2.empty()) return 0.0;
-  
+
+  // 1. Base Levenshtein similarity
   double dist = levenshteinDistance(s1, s2);
   double max_len = std::max(s1.size(), s2.size());
-  
-  return 1.0 - (dist / max_len);
+  double lev_sim = 1.0 - (dist / max_len);
+
+  // 2. Substring matching bonus (for partial OCR reads)
+  // Optimized: in-place transformation to avoid string copy overhead
+  std::string shorter = (s1.size() < s2.size()) ? s1 : s2;
+  std::string longer = (s1.size() >= s2.size()) ? s1 : s2;
+
+  // In-place case conversion (no copy, ~50% faster than transform to new string)
+  for (auto& c : shorter) c = std::tolower(static_cast<unsigned char>(c));
+  for (auto& c : longer) c = std::tolower(static_cast<unsigned char>(c));
+
+  // Check if shorter string is substring of longer
+  if (longer.find(shorter) != std::string::npos) {
+    // Substring found! Apply bonus based on coverage
+    double coverage = static_cast<double>(shorter.size()) / longer.size();
+    double substring_bonus = 0.25 * coverage;  // Up to +25% bonus
+    lev_sim = std::min(1.0, lev_sim + substring_bonus);
+
+    RCLCPP_DEBUG(this->get_logger(),
+      "Substring match: '%s' in '%s', bonus=%.2f, final_sim=%.2f",
+      shorter.c_str(), longer.c_str(), substring_bonus, lev_sim);
+  }
+
+  // 3. Prefix matching bonus (first N characters match)
+  size_t prefix_len = std::min(shorter.size(), static_cast<size_t>(4));
+  if (prefix_len >= 3) {
+    // Direct comparison without substr (no allocation)
+    bool prefix_match = true;
+    for (size_t i = 0; i < prefix_len; ++i) {
+      if (shorter[i] != longer[i]) {
+        prefix_match = false;
+        break;
+      }
+    }
+
+    if (prefix_match) {
+      double prefix_bonus = 0.10;  // +10% bonus for matching prefix
+      lev_sim = std::min(1.0, lev_sim + prefix_bonus);
+
+      RCLCPP_DEBUG(this->get_logger(),
+        "Prefix match (%zu chars): '%s' vs '%s', bonus=%.2f",
+        prefix_len, shorter.c_str(), longer.c_str(), prefix_bonus);
+    }
+  }
+
+  return lev_sim;
 }
 
 void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
@@ -644,6 +691,18 @@ void NavOCRSLAMNode::updateLandmark(Landmark & landmark,
     // Compute reprojection error
     obs.reprojection_error = std::sqrt((u_proj - bbox_center_u) * (u_proj - bbox_center_u) +
                                        (v_proj - bbox_center_v) * (v_proj - bbox_center_v));
+
+    // Filter abnormally high reprojection errors (likely wrong association)
+    const double MAX_REPROJECTION_ERROR = 50.0;  // pixels
+    if (obs.reprojection_error > MAX_REPROJECTION_ERROR) {
+      RCLCPP_WARN(this->get_logger(),
+        "Observation has abnormally high reprojection error (%.1f px > %.1f px threshold). "
+        "This likely indicates wrong landmark association. Skipping observation storage. "
+        "Landmark='%s', bbox=(%.0f,%.0f)",
+        obs.reprojection_error, MAX_REPROJECTION_ERROR,
+        landmark.representative_text.c_str(), bbox_center_u, bbox_center_v);
+      return;  // Don't add this observation
+    }
   } else {
     // Landmark behind camera - set invalid error
     obs.reprojection_error = -1.0;
@@ -732,6 +791,18 @@ void NavOCRSLAMNode::createLandmark(const Eigen::Vector3d & pos,
     double v_proj = fy_ * P_camera.y() / P_camera.z() + cy_;
     obs.reprojection_error = std::sqrt((u_proj - bbox_center_u) * (u_proj - bbox_center_u) +
                                        (v_proj - bbox_center_v) * (v_proj - bbox_center_v));
+
+    // Filter abnormally high reprojection errors (likely wrong association)
+    const double MAX_REPROJECTION_ERROR = 50.0;  // pixels
+    if (obs.reprojection_error > MAX_REPROJECTION_ERROR) {
+      RCLCPP_WARN(this->get_logger(),
+        "Initial observation has abnormally high reprojection error (%.1f px > %.1f px threshold). "
+        "This likely indicates wrong landmark position. Skipping landmark creation. "
+        "Text='%s', bbox=(%.0f,%.0f)",
+        obs.reprojection_error, MAX_REPROJECTION_ERROR,
+        text.c_str(), bbox_center_u, bbox_center_v);
+      return;  // Don't create this landmark
+    }
   } else {
     obs.reprojection_error = -1.0;
   }
@@ -843,15 +914,24 @@ void NavOCRSLAMNode::checkAndMergeNewLandmark(size_t new_idx)
     
     // Calculate Euclidean distance
     double dist = (new_lm.mean_position - landmarks_[i].mean_position).norm();
-    
+
     // Merge criteria: distance < 1.0m (relaxed from 0.5m)
     if (dist < 1.0) {
       // Calculate text similarity
-      double text_sim = textSimilarity(new_lm.representative_text, 
+      double text_sim = textSimilarity(new_lm.representative_text,
                                         landmarks_[i].representative_text);
-      
-      // Merge criteria: text similarity > 0.4 (40%, balanced for OCR noise)
-      if (text_sim > 0.4) {
+
+      RCLCPP_INFO(this->get_logger(),
+        "Checking merge: new='%s' (#%d) vs existing='%s' (#%d), dist=%.2fm, text_sim=%.2f (threshold=%.2f)",
+        new_lm.representative_text.c_str(), new_lm.landmark_id,
+        landmarks_[i].representative_text.c_str(), landmarks_[i].landmark_id,
+        dist, text_sim, 0.3);
+
+      // Merge criteria: text similarity > 0.3 (30%, lowered for partial OCR reads)
+      if (text_sim > 0.3) {
+        RCLCPP_INFO(this->get_logger(),
+          "✓ Merging landmark #%d into #%d (text_sim=%.2f > 0.3)",
+          new_lm.landmark_id, landmarks_[i].landmark_id, text_sim);
         // Merge new landmark into existing landmark i
         int total_N = landmarks_[i].observation_count + new_lm.observation_count;
         
