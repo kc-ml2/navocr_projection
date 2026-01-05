@@ -443,8 +443,25 @@ void NavOCRSLAMNode::addObservationToLandmarks(const Eigen::Vector3d & world_pos
     // Calculate Mahalanobis distance
     double d_squared = mahalanobisDistance(world_pos, landmarks_[i]);
 
+    // Spatial filter with fallback for new landmarks
+    bool passes_spatial_filter = false;
+
     // Chi-squared gate (99% confidence)
     if (d_squared < chi2_threshold_) {
+      passes_spatial_filter = true;
+    } else if (landmarks_[i].observation_count < 3) {
+      // Fallback: Use Euclidean distance for landmarks with few observations
+      // (Mahalanobis can be unreliable with small covariance)
+      double euclidean_dist = (world_pos - landmarks_[i].mean_position).norm();
+      if (euclidean_dist < 1.0) {  // 1.0m Euclidean threshold
+        passes_spatial_filter = true;
+        RCLCPP_DEBUG(this->get_logger(),
+          "Using Euclidean fallback for landmark #%d (N=%d, dist=%.2fm)",
+          landmarks_[i].landmark_id, landmarks_[i].observation_count, euclidean_dist);
+      }
+    }
+
+    if (passes_spatial_filter) {
       // Calculate text similarity ONCE and cache it
       double text_sim = textSimilarity(text, landmarks_[i].representative_text);
 
