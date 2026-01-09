@@ -1056,7 +1056,7 @@ void NavOCRSLAMNode::computeReprojectionErrors()
   }
 
   outfile << "# NavOCR Reprojection Error Data" << std::endl;
-  outfile << "# Format: landmark_id,text,timestamp,error_px" << std::endl;
+  outfile << "# Format: landmark_id,text,timestamp,bbox_u,bbox_v,proj_u,proj_v,error_px" << std::endl;
 
   int total_observations = 0;
 
@@ -1070,9 +1070,22 @@ void NavOCRSLAMNode::computeReprojectionErrors()
       // Skip invalid observations (landmark was behind camera)
       if (obs.reprojection_error < 0) continue;
 
-      // Write pre-calculated error to file
+      // Recompute projected coordinates for visualization
+      // Transform landmark from world to camera frame
+      Eigen::Vector3d P_world = lm.mean_position;
+      Eigen::Vector3d P_camera = obs.camera_orientation.inverse() * (P_world - obs.camera_position);
+
+      double proj_u = -1, proj_v = -1;
+      if (P_camera.z() > 0) {
+        proj_u = fx_ * P_camera.x() / P_camera.z() + cx_;
+        proj_v = fy_ * P_camera.y() / P_camera.z() + cy_;
+      }
+
+      // Write with coordinate info for visualization
       outfile << lm.landmark_id << ",\"" << lm.representative_text << "\","
-              << obs.timestamp.nanoseconds() / 1e9 << "," << obs.reprojection_error << std::endl;
+              << std::fixed << std::setprecision(6) << obs.timestamp.nanoseconds() / 1e9 << ","
+              << std::setprecision(2) << obs.bbox_center_u << "," << obs.bbox_center_v << ","
+              << proj_u << "," << proj_v << "," << obs.reprojection_error << std::endl;
 
       total_observations++;
     }
