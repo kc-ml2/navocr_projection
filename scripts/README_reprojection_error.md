@@ -77,7 +77,7 @@ ros2 launch navocr_projection navocr_slam_full.launch.py
 
 2. **Play your rosbag or run live**:
 ```bash
-ros2 bag play your_dataset.bag
+ros2 bag play your_dataset.bag -r 0.3 --clock
 ```
 
 3. **Stop the node (Ctrl+C)**: Reprojection errors are computed automatically on shutdown
