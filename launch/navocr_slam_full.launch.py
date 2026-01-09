@@ -40,6 +40,8 @@ def generate_launch_description():
         SetParameter(name='use_sim_time', value=True),
         
         # 1. IMU 필터 (quaternion 계산)
+        # RealSense IMU는 camera_gyro_frame에서 데이터 출력
+        # fixed_frame을 camera_link로 설정하여 올바른 좌표계 변환 적용
         Node(
             package='imu_filter_madgwick',
             executable='imu_filter_madgwick_node',
@@ -47,6 +49,7 @@ def generate_launch_description():
             parameters=[{
                 'use_mag': False,
                 'world_frame': 'enu',
+                'fixed_frame': 'camera_link',  # IMU 데이터를 camera_link 기준으로 변환
                 'publish_tf': False,
                 'use_sim_time': True,
             }],
