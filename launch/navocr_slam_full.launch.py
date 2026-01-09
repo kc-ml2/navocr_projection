@@ -23,7 +23,7 @@ def generate_launch_description():
         'frame_id': 'camera_link',
         'subscribe_depth': True,
         'subscribe_odom_info': True,
-        'approx_sync': False,
+        'approx_sync': True,  # rosbag 재생 시 필수 (메시지 동기화)
         'wait_imu_to_init': True,
         'use_sim_time': True,
     }]
